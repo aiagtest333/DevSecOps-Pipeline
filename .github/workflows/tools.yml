@@ -179,7 +179,7 @@ jobs:
 
     outputs:
       image-digest: ${{ steps.push.outputs.digest }}
-      image-ref: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+      image-ref: ${{ steps.image-meta.outputs.image-ref }}
 
     steps:
       - uses: actions/checkout@v4
@@ -212,6 +212,14 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # env context is NOT available in job-level `outputs` — only steps context
+      # is. Capture the full immutable ref here so downstream jobs can consume it.
+      - name: Capture immutable image ref
+        id: image-meta
+        run: |
+          echo "image-ref=${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}" \
+            >> "$GITHUB_OUTPUT"
 
 ###############################################################################
 # STAGE 6 — CONTAINER IMAGE SCAN
