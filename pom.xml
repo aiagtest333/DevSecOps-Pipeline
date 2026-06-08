@@ -1,17 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
          https://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-    <modelVersion>4.0.0</modelVersion>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.demo</groupId>
+  <artifactId>devsecops-demo</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
 
-    <groupId>com.demo</groupId>
-    <artifactId>devsecops-demo</artifactId>
-    <version>1.0.0</version>
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Pin the CycloneDX plugin version for reproducible builds -->
+    <cyclonedx.version>2.8.0</cyclonedx.version>
+  </properties>
 
-    <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
-    </properties>
+  <build>
+    <plugins>
+
+      <!-- Produce a self-contained executable JAR (fat JAR) -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.3.0</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <mainClass>com.demo.App</mainClass>
+            </manifest>
+          </archive>
+        </configuration>
+      </plugin>
+
+      <!--
+        CycloneDX Maven Plugin
+        Generates a full dependency SBOM (direct + transitive) in both
+        JSON and XML formats under target/bom.{json,xml}.
+
+        Key options used:
+          outputFormat  — json   (lighter, easier to attest with Cosign)
+          schemaVersion — 1.5    (latest stable CycloneDX spec)
+          includeLicenseText — true  (embed SPDX licence text for compliance)
+          includeCompileScope / includeRuntimeScope — true (prod deps only)
+          includeTestScope — false (test deps add noise, not shipped)
+      -->
+      <plugin>
+        <groupId>org.cyclonedx</groupId>
+        <artifactId>cyclonedx-maven-plugin</artifactId>
+        <version>${cyclonedx.version}</version>
+        <configuration>
+          <outputFormat>json</outputFormat>
+          <schemaVersion>1.5</schemaVersion>
+          <includeLicenseText>true</includeLicenseText>
+          <includeCompileScope>true</includeCompileScope>
+          <includeProvidedScope>false</includeProvidedScope>
+          <includeRuntimeScope>true</includeRuntimeScope>
+          <includeSystemScope>false</includeSystemScope>
+          <includeTestScope>false</includeTestScope>
+          <includeBomSerialNumber>true</includeBomSerialNumber>
+        </configuration>
+      </plugin>
+
+    </plugins>
+  </build>
 
 </project>
