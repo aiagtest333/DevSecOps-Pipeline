@@ -10,7 +10,7 @@ permissions:
   contents: read
   security-events: write
   packages: write
-  id-token: write       # Required for Cosign keyless signing via OIDC
+  id-token: write
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -18,51 +18,43 @@ env:
 
 ###############################################################################
 # STAGE 1 — SECRET SCANNING
-# Scans every commit in the push for leaked credentials/tokens.
 ###############################################################################
 jobs:
   trufflehog:
     name: Secret Scanning (TruffleHog)
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # Full history needed for diff-based scanning
-
+          fetch-depth: 0
       - name: TruffleHog OSS
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: ${{ github.event.before }}   # Only scan changed commits on push
+          base: ${{ github.event.before }}
           head: HEAD
-          extra_args: --only-verified        # Suppress unverified low-signal results
+          extra_args: --only-verified
 
 ###############################################################################
-# STAGE 2 — STATIC ANALYSIS (SAST)
-# Semgrep checks for security anti-patterns in source code.
+# STAGE 2 — SAST
 ###############################################################################
   semgrep:
     name: SAST (Semgrep)
     runs-on: ubuntu-latest
-
     container:
       image: semgrep/semgrep
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Run Semgrep SAST
         run: |
           semgrep scan \
             --config=auto \
             --sarif \
             --output=semgrep.sarif \
-            --error                  # Exit non-zero if findings exist
+            --error
         env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}   # Optional — omit for OSS-only
-
-      - name: Upload Semgrep SARIF to GitHub Security
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      - name: Upload Semgrep SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
@@ -70,52 +62,35 @@ jobs:
           category: semgrep
 
 ###############################################################################
-# STAGE 3 — BUILD + SBOM GENERATION
-# Compiles the application and produces a CycloneDX SBOM over all dependencies.
-# Only runs after secret scanning and SAST pass.
+# STAGE 3 — BUILD + SBOM
 ###############################################################################
   build:
     name: Build & Generate SBOM (CycloneDX)
     runs-on: ubuntu-latest
     needs: [trufflehog, semgrep]
-
-    outputs:
-      jar-name: ${{ steps.meta.outputs.jar-name }}
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Set Up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
-          cache: maven              # Cache ~/.m2 between runs
-
+          cache: maven
       - name: Build with Maven
         run: mvn --batch-mode --no-transfer-progress clean package -DskipTests
-
-      # CycloneDX Maven plugin must be declared in pom.xml (see project files).
-      # makeAggregateBom produces a single BOM covering direct + transitive deps.
       - name: Generate CycloneDX SBOM
         run: |
           mvn --batch-mode --no-transfer-progress \
             org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom \
             -DoutputFormat=json \
             -DincludeLicenseText=true
-
-      - name: Capture artifact name
-        id: meta
-        run: echo "jar-name=$(ls target/*.jar | head -1 | xargs basename)" >> "$GITHUB_OUTPUT"
-
-      - name: Upload JAR artifact
+      - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
           path: target/*.jar
           retention-days: 1
-
-      - name: Upload SBOM (JSON)
+      - name: Upload SBOM
         uses: actions/upload-artifact@v4
         with:
           name: sbom
@@ -124,20 +99,14 @@ jobs:
 
 ###############################################################################
 # STAGE 4 — FILESYSTEM / SCA SCAN
-# Trivy scans the repository filesystem for vulnerable dependencies and
-# misconfigured IaC before we build the container image.
 ###############################################################################
   trivy-fs:
     name: SCA / Filesystem Scan (Trivy)
     runs-on: ubuntu-latest
     needs: build
-
     steps:
       - uses: actions/checkout@v4
-
-      # Pass 1 — table format so exit-code works reliably.
-      # The SARIF format + exit-code combination has a known bug in trivy-action
-      # where it exits 1 even with 0 findings; using table here avoids that.
+      # Pass 1 — table format so exit-code works reliably (sarif+exit-code bug)
       - name: Trivy Filesystem Scan (gate)
         uses: aquasecurity/trivy-action@master
         with:
@@ -147,8 +116,7 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
-
-      # Pass 2 — SARIF format for GitHub Security tab upload (no exit-code).
+      # Pass 2 — SARIF only for GitHub Security tab upload
       - name: Trivy Filesystem Scan (SARIF)
         if: always()
         uses: aquasecurity/trivy-action@master
@@ -159,7 +127,6 @@ jobs:
           output: trivy-fs.sarif
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-
       - name: Upload Trivy FS SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v4
@@ -169,8 +136,6 @@ jobs:
 
 ###############################################################################
 # STAGE 5 — CONTAINER BUILD
-# Builds and pushes the image to GHCR.  We capture the immutable digest so
-# every downstream step references a specific image, never a mutable tag.
 ###############################################################################
   container:
     name: Build & Push Container Image
@@ -178,73 +143,71 @@ jobs:
     needs: [build, trivy-fs]
 
     outputs:
-      image-digest: ${{ steps.push.outputs.digest }}
+      # image-ref is set by the explicit capture step below.
+      # env context is NOT available in job outputs — only steps context is.
       image-ref: ${{ steps.image-meta.outputs.image-ref }}
 
     steps:
       - uses: actions/checkout@v4
-
       - name: Download JAR
         uses: actions/download-artifact@v4
         with:
           name: app-jar
           path: target/
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Docker Build & Push
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          provenance: false        # We attach our own Cosign provenance later
+          provenance: false
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # env context is NOT available in job-level `outputs` — only steps context
-      # is. Capture the full immutable ref here so downstream jobs can consume it.
+      # Capture the full immutable ref as a step output so it can be used
+      # in job-level outputs and safely passed to all downstream jobs.
       - name: Capture immutable image ref
         id: image-meta
         run: |
-          echo "image-ref=${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}" \
-            >> "$GITHUB_OUTPUT"
+          IMAGE_REF="${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+          echo "image-ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Captured image ref: ${IMAGE_REF}"
 
 ###############################################################################
 # STAGE 6 — CONTAINER IMAGE SCAN
-# Trivy scans the pushed image using its immutable digest.
+# needs: container  — so needs.container.outputs.image-ref is in scope
 ###############################################################################
   image-scan:
     name: Container Image Scan (Trivy)
     runs-on: ubuntu-latest
     needs: container
 
-    steps:
-      # checkout is needed so upload-sarif has a git context (avoids the
-      # "does not appear to be a git repository" warning seen in the logs)
-      - uses: actions/checkout@v4
+    outputs:
+      # Thread image-ref forward so signing/verify/deploy can access it
+      # via needs.image-scan.outputs.image-ref without needing to also
+      # declare needs.container (which would require being careful about
+      # transitive needs ordering).
+      image-ref: ${{ needs.container.outputs.image-ref }}
 
-      # Cache the Trivy Java DB (876 MiB) so it isn't re-downloaded every run.
-      # The DB refreshes every 3 days; keying on the date achieves that cadence.
+    steps:
+      - uses: actions/checkout@v4
       - name: Cache Trivy Java DB
         uses: actions/cache@v4
         with:
           path: ~/.cache/trivy/java-db
           key: trivy-java-db-${{ github.run_id }}
           restore-keys: trivy-java-db-
-
-      # Pass 1 — table format, exit-code enforced.
+      # Pass 1 — table + exit-code (sarif+exit-code bug workaround)
       - name: Trivy Image Scan (gate)
         uses: aquasecurity/trivy-action@master
         with:
@@ -253,8 +216,7 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
-
-      # Pass 2 — SARIF for GitHub Security tab (no exit-code).
+      # Pass 2 — SARIF for Security tab
       - name: Trivy Image Scan (SARIF)
         if: always()
         uses: aquasecurity/trivy-action@master
@@ -264,7 +226,6 @@ jobs:
           output: trivy-image.sarif
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-
       - name: Upload Image Scan SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v4
@@ -274,35 +235,33 @@ jobs:
 
 ###############################################################################
 # STAGE 7 — SIGN IMAGE + ATTEST SBOM
-# Uses Cosign with keyless signing (OIDC / Sigstore).
-# - Signs the container image by digest
-# - Signs the SBOM blob and uploads the signature as an artifact
-# - Attaches the SBOM to the image as a Cosign attestation
+# needs: image-scan  — image-ref flows via image-scan.outputs.image-ref
 ###############################################################################
   signing:
     name: Sign Image & Attest SBOM (Cosign)
     runs-on: ubuntu-latest
     needs: image-scan
 
+    outputs:
+      image-ref: ${{ needs.image-scan.outputs.image-ref }}
+
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
-      # Sign by digest — immutable reference, not a mutable :latest tag
       - name: Sign Container Image
+        env:
+          IMAGE_REF: ${{ needs.image-scan.outputs.image-ref }}
         run: |
-          cosign sign \
-            --yes \
-            ${{ needs.container.outputs.image-ref }}
+          echo "Signing: ${IMAGE_REF}"
+          cosign sign --yes "${IMAGE_REF}"
 
       - name: Download SBOM
         uses: actions/download-artifact@v4
         with:
           name: sbom
 
-      # Sign the SBOM blob and preserve both file + detached signature
       - name: Sign SBOM Blob
         run: |
           cosign sign-blob \
@@ -311,16 +270,15 @@ jobs:
             --output-signature bom.json.sig \
             --output-certificate bom.json.pem
 
-      # Attach the SBOM as a verifiable attestation on the image itself.
-      # This means `cosign verify-attestation` can later prove the SBOM
-      # came from this pipeline and has not been tampered with.
       - name: Attest SBOM to Image
+        env:
+          IMAGE_REF: ${{ needs.image-scan.outputs.image-ref }}
         run: |
           cosign attest \
             --yes \
             --predicate bom.json \
             --type cyclonedx \
-            ${{ needs.container.outputs.image-ref }}
+            "${IMAGE_REF}"
 
       - name: Upload Signed SBOM Artifacts
         uses: actions/upload-artifact@v4
@@ -333,50 +291,55 @@ jobs:
           retention-days: 90
 
 ###############################################################################
-# STAGE 8 — VERIFY SIGNATURES (optional but recommended)
-# Proves the signing step worked before we deploy anything.
+# STAGE 8 — VERIFY SIGNATURES
 ###############################################################################
   verify:
     name: Verify Signatures (Cosign)
     runs-on: ubuntu-latest
     needs: signing
 
+    outputs:
+      image-ref: ${{ needs.signing.outputs.image-ref }}
+
     steps:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
       - name: Verify Image Signature
+        env:
+          IMAGE_REF: ${{ needs.signing.outputs.image-ref }}
         run: |
           cosign verify \
             --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            ${{ needs.container.outputs.image-ref }}
+            "${IMAGE_REF}"
 
       - name: Verify SBOM Attestation
+        env:
+          IMAGE_REF: ${{ needs.signing.outputs.image-ref }}
         run: |
           cosign verify-attestation \
             --type cyclonedx \
             --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            ${{ needs.container.outputs.image-ref }}
+            "${IMAGE_REF}"
 
 ###############################################################################
 # STAGE 9 — DEPLOY
-# Only runs on pushes to main (not PRs) and only after the full security
-# gauntlet + signature verification passes.
 ###############################################################################
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
     needs: verify
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    environment: production          # Requires manual approval if configured
+    environment: production
 
     steps:
       - name: Deploy to Kubernetes
+        env:
+          IMAGE_REF: ${{ needs.verify.outputs.image-ref }}
         run: |
-          echo "Deploying ${{ needs.container.outputs.image-ref }} …"
+          echo "Deploying ${IMAGE_REF} …"
           # kubectl set image deployment/app \
-          #   app=${{ needs.container.outputs.image-ref }} \
+          #   app="${IMAGE_REF}" \
           #   --namespace=production
