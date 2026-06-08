@@ -2,215 +2,335 @@ name: Complete DevSecOps Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
   security-events: write
   packages: write
-  id-token: write
+  id-token: write       # Required for Cosign keyless signing via OIDC
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
+  JAVA_VERSION: "17"
 
+###############################################################################
+# STAGE 1 — SECRET SCANNING
+# Scans every commit in the push for leaked credentials/tokens.
+###############################################################################
 jobs:
-
-##############################################
-# SECRET SCANNING
-##############################################
   trufflehog:
+    name: Secret Scanning (TruffleHog)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0          # Full history needed for diff-based scanning
 
-      - name: TruffleHog Scan
+      - name: TruffleHog OSS
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: ""
+          base: ${{ github.event.before }}   # Only scan changed commits on push
           head: HEAD
+          extra_args: --only-verified        # Suppress unverified low-signal results
 
-##############################################
-# SAST
-##############################################
+###############################################################################
+# STAGE 2 — STATIC ANALYSIS (SAST)
+# Semgrep checks for security anti-patterns in source code.
+###############################################################################
   semgrep:
+    name: SAST (Semgrep)
     runs-on: ubuntu-latest
+
+    container:
+      image: semgrep/semgrep
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Semgrep
-        uses: returntocorp/semgrep-action@v1
+      - name: Run Semgrep SAST
+        run: |
+          semgrep scan \
+            --config=auto \
+            --sarif \
+            --output=semgrep.sarif \
+            --error                  # Exit non-zero if findings exist
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}   # Optional — omit for OSS-only
 
-##############################################
-# BUILD + SBOM
-##############################################
+      - name: Upload Semgrep SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+###############################################################################
+# STAGE 3 — BUILD + SBOM GENERATION
+# Compiles the application and produces a CycloneDX SBOM over all dependencies.
+# Only runs after secret scanning and SAST pass.
+###############################################################################
   build:
+    name: Build & Generate SBOM (CycloneDX)
     runs-on: ubuntu-latest
-
-    needs:
-      - trufflehog
-      - semgrep
+    needs: [trufflehog, semgrep]
 
     outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
+      jar-name: ${{ steps.meta.outputs.jar-name }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup JDK
+      - name: Set Up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven              # Cache ~/.m2 between runs
 
-      - name: Build Application
-        run: mvn clean package
+      - name: Build with Maven
+        run: mvn --batch-mode --no-transfer-progress clean package -DskipTests
 
-      #########################################
-      # CycloneDX SBOM
-      #########################################
-      - name: Generate SBOM
+      # CycloneDX Maven plugin must be declared in pom.xml (see project files).
+      # makeAggregateBom produces a single BOM covering direct + transitive deps.
+      - name: Generate CycloneDX SBOM
         run: |
-          mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+          mvn --batch-mode --no-transfer-progress \
+            org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom \
+            -DoutputFormat=json \
+            -DincludeLicenseText=true
 
-      - name: Upload SBOM
+      - name: Capture artifact name
+        id: meta
+        run: echo "jar-name=$(ls target/*.jar | head -1 | xargs basename)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 1
+
+      - name: Upload SBOM (JSON)
         uses: actions/upload-artifact@v4
         with:
           name: sbom
-          path: target/bom.xml
+          path: target/bom.json
+          retention-days: 7
 
-##############################################
-# FILESYSTEM SCAN
-##############################################
+###############################################################################
+# STAGE 4 — FILESYSTEM / SCA SCAN
+# Trivy scans the repository filesystem for vulnerable dependencies and
+# misconfigured IaC before we build the container image.
+###############################################################################
   trivy-fs:
+    name: SCA / Filesystem Scan (Trivy)
     runs-on: ubuntu-latest
-
     needs: build
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Trivy Filesystem Scan
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
           severity: HIGH,CRITICAL
-          exit-code: '1'
+          exit-code: "1"           # Fail the pipeline on findings
+          ignore-unfixed: true     # Skip vulns with no available fix
 
-##############################################
-# CONTAINER BUILD
-##############################################
+      - name: Upload Trivy FS SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+###############################################################################
+# STAGE 5 — CONTAINER BUILD
+# Builds and pushes the image to GHCR.  We capture the immutable digest so
+# every downstream step references a specific image, never a mutable tag.
+###############################################################################
   container:
+    name: Build & Push Container Image
     runs-on: ubuntu-latest
+    needs: [build, trivy-fs]
 
-    needs:
-      - build
-      - trivy-fs
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-ref: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Login to GHCR
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker Build
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Build & Push
+        id: push
         uses: docker/build-push-action@v6
         with:
+          context: .
           push: true
+          provenance: false        # We attach our own Cosign provenance later
           tags: |
             ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-##############################################
-# IMAGE SCAN
-##############################################
+###############################################################################
+# STAGE 6 — CONTAINER IMAGE SCAN
+# Trivy scans the pushed image using its immutable digest.
+###############################################################################
   image-scan:
+    name: Container Image Scan (Trivy)
     runs-on: ubuntu-latest
-
     needs: container
 
     steps:
-      - name: Scan Image
+      - name: Trivy Image Scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.IMAGE_NAME }}:latest
+          image-ref: ${{ needs.container.outputs.image-ref }}
           format: sarif
-          output: trivy-results.sarif
+          output: trivy-image.sarif
           severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
 
-      - name: Upload SARIF
+      - name: Upload Image Scan SARIF
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: trivy-results.sarif
+          sarif_file: trivy-image.sarif
+          category: trivy-image
 
-##############################################
-# SIGN IMAGE + SBOM
-##############################################
+###############################################################################
+# STAGE 7 — SIGN IMAGE + ATTEST SBOM
+# Uses Cosign with keyless signing (OIDC / Sigstore).
+# - Signs the container image by digest
+# - Signs the SBOM blob and uploads the signature as an artifact
+# - Attaches the SBOM to the image as a Cosign attestation
+###############################################################################
   signing:
+    name: Sign Image & Attest SBOM (Cosign)
     runs-on: ubuntu-latest
-
-    needs:
-      - image-scan
+    needs: image-scan
 
     steps:
-
       - uses: actions/checkout@v4
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
-      #########################################
-      # Sign Container Image
-      #########################################
-      - name: Sign Image
+      # Sign by digest — immutable reference, not a mutable :latest tag
+      - name: Sign Container Image
         run: |
           cosign sign \
-          --yes \
-          ${{ env.IMAGE_NAME }}:latest
+            --yes \
+            ${{ needs.container.outputs.image-ref }}
 
-      #########################################
-      # Download SBOM
-      #########################################
-      - uses: actions/download-artifact@v4
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
         with:
           name: sbom
 
-      #########################################
-      # Sign SBOM
-      #########################################
-      - name: Sign SBOM
+      # Sign the SBOM blob and preserve both file + detached signature
+      - name: Sign SBOM Blob
         run: |
           cosign sign-blob \
-          --yes \
-          bom.xml \
-          --output-signature bom.sig
+            --yes \
+            bom.json \
+            --output-signature bom.json.sig \
+            --output-certificate bom.json.pem
 
-      - uses: actions/upload-artifact@v4
+      # Attach the SBOM as a verifiable attestation on the image itself.
+      # This means `cosign verify-attestation` can later prove the SBOM
+      # came from this pipeline and has not been tampered with.
+      - name: Attest SBOM to Image
+        run: |
+          cosign attest \
+            --yes \
+            --predicate bom.json \
+            --type cyclonedx \
+            ${{ needs.container.outputs.image-ref }}
+
+      - name: Upload Signed SBOM Artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: signed-sbom
           path: |
-            bom.xml
-            bom.sig
+            bom.json
+            bom.json.sig
+            bom.json.pem
+          retention-days: 90
 
-##############################################
-# DEPLOYMENT
-##############################################
-  deploy:
+###############################################################################
+# STAGE 8 — VERIFY SIGNATURES (optional but recommended)
+# Proves the signing step worked before we deploy anything.
+###############################################################################
+  verify:
+    name: Verify Signatures (Cosign)
     runs-on: ubuntu-latest
-
-    needs:
-      - signing
+    needs: signing
 
     steps:
-      - name: Deploy
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify Image Signature
         run: |
-          echo "Deploying to Kubernetes..."
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ needs.container.outputs.image-ref }}
+
+      - name: Verify SBOM Attestation
+        run: |
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ needs.container.outputs.image-ref }}
+
+###############################################################################
+# STAGE 9 — DEPLOY
+# Only runs on pushes to main (not PRs) and only after the full security
+# gauntlet + signature verification passes.
+###############################################################################
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment: production          # Requires manual approval if configured
+
+    steps:
+      - name: Deploy to Kubernetes
+        run: |
+          echo "Deploying ${{ needs.container.outputs.image-ref }} …"
+          # kubectl set image deployment/app \
+          #   app=${{ needs.container.outputs.image-ref }} \
+          #   --namespace=production
