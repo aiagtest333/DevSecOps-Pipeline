@@ -33,7 +33,7 @@ jobs:
           path: ./
           base: ""
           head: HEAD
-          # extra_args: --only-verified
+          extra_args: --only-verified=false
 
 ###############################################################################
 # STAGE 2 — SAST
