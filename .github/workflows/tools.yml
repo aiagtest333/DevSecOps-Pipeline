@@ -33,7 +33,7 @@ jobs:
           path: ./
           base: ${{ github.event.before }}
           head: HEAD
-          extra_args: --only-verified
+          # extra_args: --only-verified
 
 ###############################################################################
 # STAGE 2 — SAST
