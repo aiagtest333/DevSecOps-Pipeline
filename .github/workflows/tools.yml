@@ -20,7 +20,7 @@ env:
 # STAGE 1 — SECRET SCANNING
 ###############################################################################
 jobs:
-trufflehog:
+  trufflehog:
     name: Secret Scanning (TruffleHog)
     runs-on: ubuntu-latest
     steps:
