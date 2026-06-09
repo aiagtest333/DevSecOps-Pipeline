@@ -20,21 +20,25 @@ env:
 # STAGE 1 — SECRET SCANNING
 ###############################################################################
 jobs:
-  trufflehog:
+trufflehog:
     name: Secret Scanning (TruffleHog)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: TruffleHog OSS
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ""
-          head: HEAD
-          extra_args: --no-verification
 
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Run TruffleHog
+        run: |
+          trufflehog git file://${{ github.workspace }} \
+            --no-verification \
+            --fail
+            
 ###############################################################################
 # STAGE 2 — SAST
 ###############################################################################
